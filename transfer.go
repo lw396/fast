@@ -16,24 +16,10 @@ const (
 	transferBufferSize = 64 * 1024
 )
 
-func (s fastService) latency(ctx context.Context, url string) (time.Duration, error) {
+func (s cloudflareService) latency(ctx context.Context, target speedTarget) (time.Duration, error) {
 	probe := func() (time.Duration, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			return 0, err
-		}
-		req.Header.Set("Range", "bytes=0-0")
-
 		start := time.Now()
-		resp, err := s.client.Do(req)
-		if err != nil {
-			return 0, err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusPartialContent {
-			return 0, fmt.Errorf("unexpected status %s", resp.Status)
-		}
-		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		if err := s.probe(ctx, target); err != nil {
 			return 0, err
 		}
 		return time.Since(start), nil
@@ -57,30 +43,38 @@ func (s fastService) latency(ctx context.Context, url string) (time.Duration, er
 	return samples[len(samples)/2], nil
 }
 
-func (s fastService) download(ctx context.Context, url string, total *atomic.Int64) {
+func (s cloudflareService) download(ctx context.Context, target speedTarget, total *atomic.Int64) error {
 	buffer := make([]byte, transferBufferSize)
 	for ctx.Err() == nil {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.downloadURL, nil)
 		if err != nil {
-			return
+			return err
 		}
 		req.Header.Set("Accept-Encoding", "identity")
+		req.Header.Set("Cache-Control", "no-store")
 
 		resp, err := s.client.Do(req)
 		if err != nil {
-			return
+			return err
 		}
 		if !isHTTPSuccess(resp.StatusCode) {
 			resp.Body.Close()
-			return
+			return fmt.Errorf("GET %s: unexpected HTTP status %s", target.downloadURL, resp.Status)
 		}
 
-		_, copyErr := io.CopyBuffer(counter{total}, resp.Body, buffer)
+		n, copyErr := io.CopyBuffer(counter{total: total}, resp.Body, buffer)
 		closeErr := resp.Body.Close()
-		if ctx.Err() != nil || copyErr != nil || closeErr != nil {
-			return
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if n == 0 {
+			return fmt.Errorf("Cloudflare returned an empty download")
 		}
 	}
+	return ctx.Err()
 }
 
 type counter struct {
@@ -92,46 +86,38 @@ func (c counter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (s fastService) upload(ctx context.Context, url string, total *atomic.Int64) {
+func (s cloudflareService) upload(ctx context.Context, target speedTarget, total *atomic.Int64) error {
 	for ctx.Err() == nil {
 		body := &uploadReader{remaining: payloadSize, total: total}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.uploadURL, body)
 		if err != nil {
-			return
+			return err
 		}
 		req.ContentLength = payloadSize
 		req.Header.Set("Content-Type", "application/octet-stream")
 
 		resp, err := s.client.Do(req)
 		if err != nil {
-			return
+			return err
+		}
+		if !isHTTPSuccess(resp.StatusCode) {
+			resp.Body.Close()
+			return fmt.Errorf("POST %s: unexpected HTTP status %s", target.uploadURL, resp.Status)
 		}
 		_, copyErr := io.Copy(io.Discard, resp.Body)
 		closeErr := resp.Body.Close()
-		if ctx.Err() != nil || copyErr != nil || closeErr != nil {
-			return
+		if copyErr != nil {
+			return copyErr
 		}
-		if !isHTTPSuccess(resp.StatusCode) {
-			return
+		if closeErr != nil {
+			return closeErr
 		}
 	}
+	return ctx.Err()
 }
 
-func (s fastService) warm(ctx context.Context, url string) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return
-	}
-	req.Header.Set("Range", "bytes=0-0")
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return
-	}
-	if resp.StatusCode == http.StatusPartialContent {
-		io.Copy(io.Discard, resp.Body)
-	}
-	resp.Body.Close()
+func (s cloudflareService) warm(ctx context.Context, target speedTarget) {
+	_ = s.probe(ctx, target)
 }
 
 type uploadReader struct {

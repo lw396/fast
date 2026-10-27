@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -80,18 +81,18 @@ func (m *measurement) stop() {
 	}
 }
 
-type transferFunc func(context.Context, string, *atomic.Int64)
+type transferFunc func(context.Context, speedTarget, *atomic.Int64) error
 
 type dependencies struct {
-	targets  func(context.Context, int) ([]string, error)
+	targets  func(context.Context, int) ([]speedTarget, error)
 	download transferFunc
 	upload   transferFunc
-	warm     func(context.Context, string)
-	latency  func(context.Context, string) (time.Duration, error)
+	warm     func(context.Context, speedTarget)
+	latency  func(context.Context, speedTarget) (time.Duration, error)
 }
 
 func defaultDependencies() dependencies {
-	service := newFastService()
+	service := newCloudflareService()
 	return dependencies{
 		targets:  service.targets,
 		download: service.download,
@@ -107,7 +108,7 @@ type Model struct {
 	cancel context.CancelFunc
 	now    func() time.Time
 
-	targets []string
+	targets []speedTarget
 	err     error
 	phase   phase
 
@@ -150,7 +151,7 @@ func (m Model) Init() tea.Cmd {
 }
 
 type targetsMsg struct {
-	urls []string
+	urls []speedTarget
 	err  error
 }
 
@@ -161,25 +162,54 @@ func (m Model) fetchTargets() tea.Msg {
 	return targetsMsg{urls: urls, err: err}
 }
 
-func startTransfers(ctx context.Context, targets []string, total *atomic.Int64, transfer transferFunc) tea.Msg {
+type transferMsg struct {
+	phase phase
+	err   error
+}
+
+func startTransfers(
+	ctx context.Context,
+	targets []speedTarget,
+	total *atomic.Int64,
+	transfer transferFunc,
+	currentPhase phase,
+) tea.Msg {
+	failures := make([]error, len(targets))
 	var wg sync.WaitGroup
-	for _, target := range targets {
-		wg.Add(1)
-		go func(target string) {
-			defer wg.Done()
-			transfer(ctx, target, total)
-		}(target)
+	for i, target := range targets {
+		wg.Go(func() {
+			failures[i] = transfer(ctx, target, total)
+		})
 	}
 	wg.Wait()
-	return nil
+	if ctx.Err() != nil {
+		return nil // Reaching the measurement deadline or quitting is expected.
+	}
+	err := errors.Join(failures...)
+	if err == nil {
+		err = errors.New("all transfers stopped before the measurement deadline")
+	}
+	return transferMsg{phase: currentPhase, err: err}
 }
 
 func (m Model) measureDownload() tea.Msg {
-	return startTransfers(m.download.ctx, m.targets, m.download.bytes, m.deps.download)
+	return startTransfers(
+		m.download.ctx,
+		m.targets,
+		m.download.bytes,
+		m.deps.download,
+		phaseDownloading,
+	)
 }
 
 func (m Model) measureUpload() tea.Msg {
-	return startTransfers(m.upload.ctx, m.targets, m.upload.bytes, m.deps.upload)
+	return startTransfers(
+		m.upload.ctx,
+		m.targets,
+		m.upload.bytes,
+		m.deps.upload,
+		phaseUploading,
+	)
 }
 
 func (m Model) warmUpload() tea.Msg {
@@ -188,11 +218,9 @@ func (m Model) warmUpload() tea.Msg {
 
 	var wg sync.WaitGroup
 	for _, target := range m.targets {
-		wg.Add(1)
-		go func(target string) {
-			defer wg.Done()
+		wg.Go(func() {
 			m.deps.warm(ctx, target)
-		}(target)
+		})
 	}
 	wg.Wait()
 	return nil
@@ -213,7 +241,17 @@ func (m Model) measurePing() tea.Msg {
 	return pingMsg{duration: d, err: err}
 }
 
+func (m Model) fail(err error) (tea.Model, tea.Cmd) {
+	m.err = err
+	m.quitting = true
+	m.stop()
+	return m, tea.Quit
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.quitting {
+		return m, nil
+	}
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -225,16 +263,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case targetsMsg:
 		if msg.err != nil {
-			m.err = msg.err
-			m.quitting = true
-			m.stop()
-			return m, tea.Quit
+			return m.fail(msg.err)
 		}
 		if len(msg.urls) == 0 {
-			m.err = errors.New("no targets")
-			m.quitting = true
-			m.stop()
-			return m, tea.Quit
+			return m.fail(errors.New("no targets"))
 		}
 
 		m.targets = msg.urls
@@ -242,10 +274,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.download.start(m.ctx, m.now(), duration)
 		return m, tea.Batch(nextTick(), m.measureDownload)
 
-	case pingMsg:
-		if msg.err == nil {
-			m.ping = msg.duration
+	case transferMsg:
+		if msg.phase == m.phase && msg.err != nil {
+			direction := "download"
+			if msg.phase == phaseUploading {
+				direction = "upload"
+			}
+			return m.fail(fmt.Errorf("Cloudflare %s: %w", direction, msg.err))
 		}
+
+	case pingMsg:
+		if msg.err != nil {
+			return m.fail(fmt.Errorf("Cloudflare latency: %w", msg.err))
+		}
+		m.ping = msg.duration
 		m.phase = phaseDone
 		m.stop()
 		return m, tea.Quit
@@ -262,6 +304,9 @@ func (m Model) updateTick(now time.Time) (tea.Model, tea.Cmd) {
 	case phaseDownloading:
 		elapsed := m.download.sample(now)
 		if elapsed >= duration {
+			if m.download.bytes.Load() == 0 {
+				return m.fail(errors.New("Cloudflare download: no data received before timeout"))
+			}
 			m.download.stop()
 			m.phase = phaseUploading
 			m.upload.start(m.ctx, now, duration)
@@ -275,6 +320,9 @@ func (m Model) updateTick(now time.Time) (tea.Model, tea.Cmd) {
 
 	case phaseUploading:
 		if m.upload.sample(now) >= duration {
+			if m.upload.bytes.Load() == 0 {
+				return m.fail(errors.New("Cloudflare upload: no data sent before timeout"))
+			}
 			m.upload.stop()
 			m.phase = phaseMeasuringPing
 			return m, m.measurePing

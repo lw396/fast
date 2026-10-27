@@ -24,6 +24,20 @@ go install github.com/maaslalani/fast@main
 
 Or download a binary from the [releases](https://github.com/maaslalani/fast/releases).
 
+### This fork
+
+The instructions above describe upstream. This fork uses [Cloudflare Speed Test](https://speed.cloudflare.com)
+instead of Fast.com to measure download, upload and HTTP latency. Build and run it with Go:
+
+```sh
+git clone https://github.com/lw396/fast.git
+cd fast
+go build -o fast .
+./fast
+```
+
+If traffic goes through a VPN or proxy, results reflect that path rather than your direct connection.
+
 ## License
 
 [MIT](https://github.com/maaslalani/fast/blob/master/LICENSE)
